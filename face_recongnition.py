@@ -13,6 +13,12 @@ from sklearn.model_selection import train_test_split
 cap = cv2.VideoCapture(0)
 face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
 
+# Smoother face tracking variables
+prev_faces = []
+tracked_faces = []
+frame_count = 0
+SMOOTHING_FACTOR = 0.7  # Higher = more smoothing
+
 # Ensure necessary directories exist
 os.makedirs('dataset', exist_ok=True)
 os.makedirs('trainer', exist_ok=True)
@@ -23,7 +29,6 @@ def clear_dataset():
     
     if confirm == 'yes':
         try:
-            # Delete all contents of dataset folder
             for filename in os.listdir('dataset'):
                 file_path = os.path.join('dataset', filename)
                 try:
@@ -34,7 +39,6 @@ def clear_dataset():
                 except Exception as e:
                     print(f'Failed to delete {file_path}. Reason: {e}')
             
-            # Also delete trained model
             if os.path.exists('trainer/face_recognition_model.h5'):
                 os.remove('trainer/face_recognition_model.h5')
             if os.path.exists('trainer/class_names.npy'):
@@ -71,7 +75,7 @@ def collect_dataset():
             break
             
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        faces = face_cascade.detectMultiScale(gray, 1.3, 5)
+        faces = face_cascade.detectMultiScale(gray, 1.1, 5, minSize=(60, 60))
         
         face_img = None
         status = "No face detected"
@@ -204,6 +208,8 @@ def train_model():
     print(f"Model can recognize {len(class_names)} people")
 
 def recognize_faces():
+    global prev_faces, tracked_faces, frame_count
+    
     if not os.path.exists('trainer/face_recognition_model.h5'):
         print("\nError: Model not found!")
         print("Please train the model first using option 2")
@@ -221,7 +227,52 @@ def recognize_faces():
             break
             
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        faces = face_cascade.detectMultiScale(gray, 1.3, 5)
+        
+        # Detect faces every 3rd frame for better performance
+        if frame_count % 3 == 0:
+            faces = face_cascade.detectMultiScale(
+                gray, 
+                scaleFactor=1.1, 
+                minNeighbors=5, 
+                minSize=(60, 60),
+                flags=cv2.CASCADE_SCALE_IMAGE
+            )
+            
+            # Apply smoothing and tracking
+            if len(faces) > 0:
+                if len(prev_faces) > 0:
+                    tracked_faces = []
+                    for (x, y, w, h) in faces:
+                        # Find closest match from previous frame
+                        best_match = None
+                        min_dist = float('inf')
+                        
+                        for (px, py, pw, ph) in prev_faces:
+                            dist = np.sqrt((x-px)**2 + (y-py)**2)
+                            if dist < min_dist and dist < max(w, h):
+                                min_dist = dist
+                                best_match = (px, py, pw, ph)
+                        
+                        if best_match:
+                            # Apply smoothing
+                            smooth_x = int(x * (1-SMOOTHING_FACTOR) + best_match[0] * SMOOTHING_FACTOR)
+                            smooth_y = int(y * (1-SMOOTHING_FACTOR) + best_match[1] * SMOOTHING_FACTOR)
+                            smooth_w = int(w * (1-SMOOTHING_FACTOR) + best_match[2] * SMOOTHING_FACTOR)
+                            smooth_h = int(h * (1-SMOOTHING_FACTOR) + best_match[3] * SMOOTHING_FACTOR)
+                            tracked_faces.append((smooth_x, smooth_y, smooth_w, smooth_h))
+                        else:
+                            tracked_faces.append((x, y, w, h))
+                else:
+                    tracked_faces = faces
+                
+                prev_faces = tracked_faces
+            else:
+                tracked_faces = []
+        else:
+            # Use tracked faces between detections
+            faces = tracked_faces
+        
+        frame_count += 1
         
         for (x, y, w, h) in faces:
             face_img = frame[y:y+h, x:x+w]
@@ -233,7 +284,8 @@ def recognize_faces():
             confidence = np.max(predictions)
             person_id = np.argmax(predictions)
             
-            if confidence > 0.7:
+            if confidence > 0.61:
+              # Lowered threshold for better recognition
                 name = class_names[person_id]
                 color = (0, 255, 0)  # Green
                 label = f"{name} ({confidence*100:.1f}%)"
@@ -250,6 +302,10 @@ def recognize_faces():
             break
     
     cv2.destroyAllWindows()
+    # Reset tracking variables
+    prev_faces = []
+    tracked_faces = []
+    frame_count = 0
 
 def main():
     while True:
