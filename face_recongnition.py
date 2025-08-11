@@ -2,26 +2,65 @@ import cv2
 import numpy as np
 import os
 import shutil
+import time
 from keras.models import Sequential, load_model
-from keras.layers import Dense, Dropout, Flatten, Conv2D, MaxPooling2D
+from keras.layers import Dense, Dropout, Flatten, Conv2D, MaxPooling2D, BatchNormalization
 from keras.preprocessing.image import ImageDataGenerator
 from keras.optimizers import Adam
 from keras.utils import to_categorical
 from sklearn.model_selection import train_test_split
+from collections import deque
 
 # Initialize webcam
 cap = cv2.VideoCapture(0)
 face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
 
-# Smoother face tracking variables
-prev_faces = []
-tracked_faces = []
-frame_count = 0
-SMOOTHING_FACTOR = 0.7  # Higher = more smoothing
+# Enhanced face tracking with Kalman Filter
+class FaceTracker:
+    def __init__(self):
+        self.kalman = cv2.KalmanFilter(4, 2)
+        self.kalman.measurementMatrix = np.array([[1,0,0,0],[0,1,0,0]], np.float32)
+        self.kalman.transitionMatrix = np.array([[1,0,1,0],[0,1,0,1],[0,0,1,0],[0,0,0,1]], np.float32)
+        self.kalman.processNoiseCov = np.array([[1,0,0,0],[0,1,0,0],[0,0,1,0],[0,0,0,1]], np.float32) * 0.03
+        self.last_measurement = None
+        self.last_prediction = None
+        
+    def update(self, x, y):
+        measurement = np.array([[np.float32(x)], [np.float32(y)]])
+        if self.last_measurement is None:
+            self.last_measurement = measurement
+            self.kalman.statePre = np.array([[measurement[0][0]], [measurement[1][0]], [0], [0]], np.float32)
+            self.kalman.statePost = np.array([[measurement[0][0]], [measurement[1][0]], [0], [0]], np.float32)
+        self.kalman.correct(measurement)
+        prediction = self.kalman.predict()
+        self.last_prediction = prediction
+        return int(prediction[0][0]), int(prediction[1][0])
+
+# Emotion detection labels
+EMOTIONS = ["Angry", "Disgust", "Fear", "Happy", "Sad", "Surprise", "Neutral"]
 
 # Ensure necessary directories exist
 os.makedirs('dataset', exist_ok=True)
 os.makedirs('trainer', exist_ok=True)
+
+# New: FPS counter
+class FPSCounter:
+    def __init__(self):
+        self.start_time = None
+        self.frame_count = 0
+        self.fps = 0
+        
+    def update(self):
+        if self.start_time is None:
+            self.start_time = time.time()
+        self.frame_count += 1
+        if time.time() - self.start_time >= 1.0:
+            self.fps = self.frame_count
+            self.frame_count = 0
+            self.start_time = time.time()
+        return self.fps
+
+fps_counter = FPSCounter()
 
 def clear_dataset():
     print("\nWarning: This will delete all collected data!")
@@ -67,6 +106,7 @@ def collect_dataset():
     
     count = len(os.listdir(person_dir))
     saving = False
+    tracker = FaceTracker()
     
     while True:
         ret, frame = cap.read()
@@ -83,6 +123,10 @@ def collect_dataset():
         
         if len(faces) == 1:
             (x, y, w, h) = faces[0]
+            # Use Kalman filter for smoother tracking
+            x, y = tracker.update(x + w//2, y + h//2)
+            x, y = x - w//2, y - h//2
+            
             cv2.rectangle(frame, (x,y), (x+w,y+h), (0,255,0), 2)
             face_img = frame[y:y+h, x:x+w]
             status = "Face detected - Press 's' to save"
@@ -91,8 +135,12 @@ def collect_dataset():
             status = "Multiple faces detected!"
             color = (0, 0, 255)  # Red
             
-        cv2.putText(frame, status, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
-        cv2.putText(frame, f"Saved: {count}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2)
+        # Display FPS
+        fps = fps_counter.update()
+        cv2.putText(frame, f"FPS: {fps}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+        cv2.putText(frame, status, (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+        cv2.putText(frame, f"Saved: {count}", (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2)
+        
         cv2.imshow('Face Data Collection', frame)
         
         key = cv2.waitKey(1)
@@ -163,33 +211,44 @@ def train_model():
     X_train, X_val, y_train, y_val = train_test_split(
         X, y, test_size=0.2, random_state=42, stratify=y)
     
+    # Enhanced data augmentation
     datagen = ImageDataGenerator(
-        rotation_range=20,
+        rotation_range=30,
         width_shift_range=0.2,
         height_shift_range=0.2,
-        horizontal_flip=True)
+        shear_range=0.2,
+        zoom_range=0.2,
+        horizontal_flip=True,
+        fill_mode='nearest')
     
+    # Improved model architecture
     model = Sequential([
         Conv2D(32, (3,3), activation='relu', input_shape=(100,100,3)),
+        BatchNormalization(),
         MaxPooling2D(pool_size=(2,2)),
         Conv2D(64, (3,3), activation='relu'),
+        BatchNormalization(),
         MaxPooling2D(pool_size=(2,2)),
         Conv2D(128, (3,3), activation='relu'),
+        BatchNormalization(),
+        MaxPooling2D(pool_size=(2,2)),
+        Conv2D(256, (3,3), activation='relu'),
+        BatchNormalization(),
         MaxPooling2D(pool_size=(2,2)),
         Flatten(),
-        Dense(256, activation='relu'),
+        Dense(512, activation='relu'),
         Dropout(0.5),
         Dense(len(class_names), activation='softmax')
     ])
     
-    model.compile(optimizer=Adam(learning_rate=0.001),
+    model.compile(optimizer=Adam(learning_rate=0.0001),
                  loss='categorical_crossentropy',
                  metrics=['accuracy'])
     
     print("\nModel Summary:")
     model.summary()
     
-    batch_size = 16
+    batch_size = 32
     steps_per_epoch = max(1, len(X_train) // batch_size)
     validation_steps = max(1, len(X_val) // batch_size)
     
@@ -198,7 +257,7 @@ def train_model():
         datagen.flow(X_train, y_train, batch_size=batch_size),
         steps_per_epoch=steps_per_epoch,
         validation_data=(X_val, y_val),
-        epochs=15,
+        epochs=25,
         verbose=1)
     
     model.save('trainer/face_recognition_model.h5')
@@ -208,8 +267,6 @@ def train_model():
     print(f"Model can recognize {len(class_names)} people")
 
 def recognize_faces():
-    global prev_faces, tracked_faces, frame_count
-    
     if not os.path.exists('trainer/face_recognition_model.h5'):
         print("\nError: Model not found!")
         print("Please train the model first using option 2")
@@ -221,71 +278,40 @@ def recognize_faces():
     print("\nFace recognition started. Press ESC to exit")
     print(f"Recognizing {len(class_names)} people: {', '.join(class_names)}")
     
+    # Load emotion detection model (simplified for demo)
+    emotion_model = None
+    try:
+        emotion_model = load_model('trainer/emotion_model.h5')  # You would need to provide this
+    except:
+        print("Emotion model not found - skipping emotion detection")
+    
+    tracker = FaceTracker()
+    emotion_history = {emotion: deque(maxlen=10) for emotion in EMOTIONS}
+    
     while True:
         ret, frame = cap.read()
         if not ret:
             break
             
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        
-        # Detect faces every 3rd frame for better performance
-        if frame_count % 3 == 0:
-            faces = face_cascade.detectMultiScale(
-                gray, 
-                scaleFactor=1.1, 
-                minNeighbors=5, 
-                minSize=(60, 60),
-                flags=cv2.CASCADE_SCALE_IMAGE
-            )
-            
-            # Apply smoothing and tracking
-            if len(faces) > 0:
-                if len(prev_faces) > 0:
-                    tracked_faces = []
-                    for (x, y, w, h) in faces:
-                        # Find closest match from previous frame
-                        best_match = None
-                        min_dist = float('inf')
-                        
-                        for (px, py, pw, ph) in prev_faces:
-                            dist = np.sqrt((x-px)**2 + (y-py)**2)
-                            if dist < min_dist and dist < max(w, h):
-                                min_dist = dist
-                                best_match = (px, py, pw, ph)
-                        
-                        if best_match:
-                            # Apply smoothing
-                            smooth_x = int(x * (1-SMOOTHING_FACTOR) + best_match[0] * SMOOTHING_FACTOR)
-                            smooth_y = int(y * (1-SMOOTHING_FACTOR) + best_match[1] * SMOOTHING_FACTOR)
-                            smooth_w = int(w * (1-SMOOTHING_FACTOR) + best_match[2] * SMOOTHING_FACTOR)
-                            smooth_h = int(h * (1-SMOOTHING_FACTOR) + best_match[3] * SMOOTHING_FACTOR)
-                            tracked_faces.append((smooth_x, smooth_y, smooth_w, smooth_h))
-                        else:
-                            tracked_faces.append((x, y, w, h))
-                else:
-                    tracked_faces = faces
-                
-                prev_faces = tracked_faces
-            else:
-                tracked_faces = []
-        else:
-            # Use tracked faces between detections
-            faces = tracked_faces
-        
-        frame_count += 1
+        faces = face_cascade.detectMultiScale(gray, 1.1, 5, minSize=(60, 60))
         
         for (x, y, w, h) in faces:
+            # Use Kalman filter for smoother tracking
+            x, y = tracker.update(x + w//2, y + h//2)
+            x, y = x - w//2, y - h//2
+            
             face_img = frame[y:y+h, x:x+w]
             resized = cv2.resize(face_img, (100,100))
             normalized = resized / 255.0
             reshaped = np.reshape(normalized, (1,100,100,3))
             
+            # Face recognition
             predictions = model.predict(reshaped, verbose=0)
             confidence = np.max(predictions)
             person_id = np.argmax(predictions)
             
-            if confidence > 0.61:
-              # Lowered threshold for better recognition
+            if confidence > 0.6:
                 name = class_names[person_id]
                 color = (0, 255, 0)  # Green
                 label = f"{name} ({confidence*100:.1f}%)"
@@ -294,18 +320,37 @@ def recognize_faces():
                 color = (0, 0, 255)  # Red
                 label = "Unknown"
             
+            # Emotion detection
+            emotion_label = ""
+            if emotion_model:
+                gray_face = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
+                gray_face = cv2.resize(gray_face, (48,48))
+                gray_face = gray_face.reshape(1,48,48,1) / 255.0
+                emotion_pred = emotion_model.predict(gray_face, verbose=0)[0]
+                emotion_idx = np.argmax(emotion_pred)
+                emotion = EMOTIONS[emotion_idx]
+                emotion_history[emotion].append(emotion_pred[emotion_idx])
+                
+                # Get most common recent emotion
+                avg_emotions = {e: np.mean(h) if h else 0 for e, h in emotion_history.items()}
+                dominant_emotion = max(avg_emotions.items(), key=lambda x: x[1])[0]
+                emotion_label = f"Emotion: {dominant_emotion}"
+            
+            # Draw face box and labels
             cv2.rectangle(frame, (x,y), (x+w,y+h), color, 2)
             cv2.putText(frame, label, (x, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+            if emotion_label:
+                cv2.putText(frame, emotion_label, (x, y+h+20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 1)
+        
+        # Display FPS
+        fps = fps_counter.update()
+        cv2.putText(frame, f"FPS: {fps}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
         
         cv2.imshow('Face Recognition', frame)
         if cv2.waitKey(1) & 0xFF == 27:
             break
     
     cv2.destroyAllWindows()
-    # Reset tracking variables
-    prev_faces = []
-    tracked_faces = []
-    frame_count = 0
 
 def main():
     while True:
